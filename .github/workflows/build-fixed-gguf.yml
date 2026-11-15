@@ -1,0 +1,109 @@
+name: Build template-fixed GGUF and upload to Hugging Face
+
+# What this does:
+#   1. Downloads dahara1's Qwen3.5-4B-UD-Q4_K_XL.gguf and his standalone chat_template.jinja
+#   2. Verifies the GGUF sha256 against the known-good value
+#   3. Rewrites ONLY the embedded chat template (gguf-new-metadata, weights untouched)
+#   4. Verifies the new embedded template carries the cache-reuse fix
+#   5. Creates a PRIVATE model repo on your Hugging Face account and uploads
+#      the fixed GGUF + the model card (model-card.md -> README.md)
+#
+# Required setup (one time):
+#   - Repo secret HF_TOKEN: a Hugging Face access token with "Write" permission
+#     (huggingface.co -> Settings -> Access Tokens -> Create new token -> Write)
+#
+# Run it from: Actions tab -> "Build template-fixed GGUF..." -> Run workflow
+#   Input hf_repo_id: your HF repo id, e.g. "yourname/Qwen3.5-4B-UD-Q4_K_XL-template-fixed"
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo_id:
+        description: "Hugging Face repo id (username/repo-name)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SRC_REPO: "dahara1/Qwen3.5-4B-UD-japanese-imatrix"
+      SRC_FILE: "Qwen3.5-4B-UD-Q4_K_XL.gguf"
+      SRC_SHA256: "e57e3a553c1e90e1d320980fe5a8312650a6f3d9b9dc7764377d80b19192f097"
+    steps:
+      - name: Check out this repository (model card + verify script)
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install gguf huggingface_hub
+
+      - name: Download source GGUF and fixed standalone template
+        run: |
+          curl -sL -o original.gguf "https://huggingface.co/${SRC_REPO}/resolve/main/${SRC_FILE}"
+          curl -sL -o chat_template.jinja "https://huggingface.co/${SRC_REPO}/raw/main/chat_template.jinja"
+          ls -la
+
+      - name: Verify source GGUF integrity
+        run: |
+          echo "${SRC_SHA256}  original.gguf" | sha256sum -c -
+
+      - name: Sanity-check the standalone template carries the fix
+        run: |
+          grep -F "ns.last_query_index and reasoning_content" chat_template.jinja
+
+      - name: Rewrite embedded chat template (metadata only, weights untouched)
+        run: |
+          gguf-new-metadata original.gguf "${SRC_FILE}" --chat-template-file chat_template.jinja --force
+          ls -la
+
+      - name: Verify the new embedded template
+        run: |
+          python3 scripts/verify_template.py "${SRC_FILE}"
+          # Output must be within 1 MB of the original size (template string grew slightly)
+          python3 - <<'EOF'
+          import os
+          a = os.path.getsize("original.gguf"); b = os.path.getsize("${SRC_FILE}")
+          print(f"original={a} fixed={b} diff={b-a}")
+          assert abs(b - a) < 1_000_000, "size changed too much - something else was rewritten"
+          EOF
+
+      - name: Upload fixed GGUF and model card to Hugging Face (private repo)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ inputs.hf_repo_id }}
+        run: |
+          sed "s|{{HF_REPO_ID}}|${HF_REPO_ID}|g" model-card.md > README.md
+          python3 - <<'EOF'
+          import os
+          from huggingface_hub import HfApi
+          repo_id = os.environ["HF_REPO_ID"]
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
+          api.upload_file(
+              path_or_fileobj=os.environ["SRC_FILE"],
+              path_in_repo=os.environ["SRC_FILE"],
+              repo_id=repo_id, repo_type="model",
+              commit_message="Add template-fixed GGUF (embedded chat template replaced with dahara1's fixed standalone jinja)",
+          )
+          api.upload_file(
+              path_or_fileobj="README.md",
+              path_in_repo="README.md",
+              repo_id=repo_id, repo_type="model",
+              commit_message="Add model card",
+          )
+          print(f"Done: https://huggingface.co/{repo_id}")
+          EOF
