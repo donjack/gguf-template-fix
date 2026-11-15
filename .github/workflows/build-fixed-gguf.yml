@@ -74,12 +74,12 @@ jobs:
         run: |
           python3 scripts/verify_template.py "${SRC_FILE}"
           # Output must be within 1 MB of the original size (template string grew slightly)
-          python3 - <<'EOF'
+          python3 - <<'PYEOF'
           import os
-          a = os.path.getsize("original.gguf"); b = os.path.getsize("${SRC_FILE}")
+          a = os.path.getsize("original.gguf"); b = os.path.getsize(os.environ["SRC_FILE"])
           print(f"original={a} fixed={b} diff={b-a}")
           assert abs(b - a) < 1_000_000, "size changed too much - something else was rewritten"
-          EOF
+          PYEOF
 
       - name: Upload fixed GGUF and model card to Hugging Face (private repo)
         env:
